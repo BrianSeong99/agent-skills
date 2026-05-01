@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# editors
+.vscode/
+.idea/
+*.swp
+
+# state dirs that ship inside skills/ should never be committed; canonical state
+# lives at ~/.claude/<skill-name>/ on each user's machine.
+**/runs.jsonl
+**/preflight.json
