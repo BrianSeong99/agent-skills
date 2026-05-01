@@ -1,126 +1,202 @@
 ---
 name: orchestrate
-description: Route a task to the most cost-appropriate AI backend (Claude Opus/Sonnet via subagent, OpenAI Codex CLI, or a local Ollama model) instead of running everything on the current model. Use when the user asks to dispatch/route/orchestrate a task, mentions saving tokens or using a cheaper/local/specialized model, names a backend explicitly ("use codex", "run on ollama", "do this on opus"), or describes a task whose obvious best home is not the current host model — e.g. quick local-only string transforms (Ollama), narrow code edits (Codex), open-ended planning (Opus). Also runs as `/orchestrate "<task>"`.
+description: Dispatch a task to the right backend AND have a different model peer-review the result. For substantive code or planning work, runs a build phase (Opus or Codex, auto-picked by signal) followed by a cross-model review phase (the other one) — never the same model on both sides. For trivial code edits, single-pass on Codex spark. For one-shot text transforms, single-pass on local Ollama. Use when the user asks to dispatch/route/orchestrate a task, mentions saving tokens or using a cheaper/local/specialized model, names a backend explicitly ("use codex", "run on opus", "ollama for this"), or asks for a peer review / second-pair-of-eyes / cross-check on existing work. Also runs as `/orchestrate "<task>"`.
 ---
 
-# orchestrate — multi-backend task dispatcher
+# orchestrate — multi-backend dispatcher with cross-model peer review
 
-You (the host Claude session) are the orchestrator. Your job: classify the user's task, dispatch it to the right backend, log the run, and return the result with a one-line attribution. Do **not** do the task yourself unless the route lands on a Claude tier — then you spawn a subagent at that tier.
+You (the host Claude session) are the orchestrator. For substantive code/plan work, your job is **build + review**: classify the task, auto-pick the builder, dispatch to the builder, dispatch to a *different* reviewer model, synthesize a 3-section response, log both runs, return. For quick-lookups and tiny code edits, you do a single-pass dispatch with no review.
+
+The cross-review pattern is the point of this skill. The literature on LLM-as-judge biases is brutal: same-model self-review is actively misleading. **Builder ≠ reviewer, no exceptions.**
 
 ## Protocol — follow in order
 
 ### 0. Preflight (gate every invocation)
 
-Run preflight to discover available backends:
-
 ```bash
 bash ~/.claude/skills/orchestrate/preflight.sh
 ```
 
-The script writes/caches `~/.claude/orchestrate/preflight.json` (5min TTL) and prints the JSON. Read `.codex.ok` and `.ollama.ok`.
+Reads/caches `~/.claude/orchestrate/preflight.json` (5min TTL). Inspect `.codex.ok` and `.ollama.ok`.
 
-- **If a backend the route needs is `ok:false`**, surface the failure to the user with the fix command (from `.msg`) and either (a) reroute to a working tier, or (b) abort if the user explicitly asked for that backend. Do not silently retry.
-- **Graceful degradation:** if Codex or Ollama isn't installed at all, the skill still works — every route just falls through to Claude tiers. Don't refuse to operate.
-- Claude tiers (Opus / Sonnet via the Agent tool) are always available; no preflight needed for them.
+- If a backend you'd route to is `ok:false`: surface `.msg` to the user (it has the fix command verbatim) and either (a) reroute to a working tier, or (b) abort if the user pinned that backend.
+- **Cross-review specifically requires both Codex and a Claude tier to be reachable.** If Codex is down and the route is `code-build` or `planning`, fall back to a single Claude pass with a note in the attribution. Do not silently skip the review — tell the user.
+- Claude tiers (Opus / Sonnet) are always available; no preflight needed for them.
 
 ### 1. Classify
 
-Read `~/.claude/skills/orchestrate/routing.md`. Pick exactly **one** category for the task. Map category → backend:
+Read `~/.claude/skills/orchestrate/routing.md`. Pick exactly one category:
 
-| Category | Backend | Model |
+| Category | Phase 1 (build) | Phase 2 (review) |
 |---|---|---|
-| `quick-lookup` | Ollama (local) | configured local model (default `gemma3:4b`; override via `OLLAMA_MODEL`) |
-| `code-edit-narrow` | Codex via `codex:codex-rescue` | spark (`--model gpt-5.3-codex-spark --write`) |
-| `code-edit-broad` | Codex via `codex:codex-rescue` | default (`--write`, no `--model`) |
-| `code-review` | Sonnet subagent | n/a |
-| `planning` | Opus subagent | n/a |
-| `prose` | Sonnet subagent | n/a |
-| `judge` (only when user explicitly asks for a second opinion) | Sonnet **or** Opus, MUST differ from generator | n/a |
-| fallback | Sonnet subagent | n/a |
+| `quick-lookup` | Ollama (local model) | none |
+| `prose` | Sonnet | none |
+| `code-quick` | Codex spark (`--model gpt-5.3-codex-spark --write`) | none |
+| `code-build` | **auto-pick: Opus OR Codex** by signal (see routing.md) | the other one |
+| `planning` | **Opus** | Codex |
+| `code-review-only` | n/a (artifact already exists) | cross-model from generator |
+| `judge` (explicit second-opinion request) | n/a | cross-model |
+| fallback | Sonnet | none |
 
-Be smart, not stingy: borderline-but-recoverable → cheaper tier; high-stakes/irreversible → skip the cheap tier and go straight to Opus or Codex-default.
+**Auto-pick rules for `code-build`** (full detail in routing.md):
+- Refactor / migration / port-from-X-to-Y / multi-file restructure / codebase-wide change → **Codex builds**, Opus reviews. Codex is stronger at edit volume + repo navigation.
+- Novel feature / algorithm / design-driven implementation / architectural code / "implement from this spec" → **Opus builds**, Codex reviews. Opus is stronger at reasoning-shaped code.
+- Borderline → Opus builds, Codex reviews (default toward reasoning).
+- **User override always wins.** "use codex to build" / "use opus to build" / "build with codex" → honor it; reviewer becomes the other.
 
-### 2. Dispatch
+### 2. Phase 1 — Build
 
-Use **exactly one** of the four dispatch paths below. Do not combine them in V1; no auto-critique loop.
+Dispatch to the builder. The builder must include a `Decisions:` block in its output so the reviewer has visibility into non-obvious choices.
 
-#### 2a. Ollama (`quick-lookup`)
+#### 2a. Codex builder (`code-quick`, `code-build` when Codex is picked)
 
-```bash
-bash ~/.claude/skills/orchestrate/scripts/dispatch-ollama.sh "<the prompt you want the local model to answer>"
-```
-
-Read the prompt-template guidance at `~/.claude/skills/orchestrate/prompts/quick-lookup.md` for shape. The script returns the model's response on stdout, or exits non-zero on daemon failure / timeout (30s default budget). On failure, fall back to Sonnet and note the fallback in your attribution line.
-
-#### 2b. Codex (`code-edit-narrow`, `code-edit-broad`)
-
-Spawn the existing Codex subagent via the `Agent` tool — do **not** call `codex-companion.mjs` directly. Pass the user's task as the prompt; include the model flag only for `code-edit-narrow`:
-
-- For narrow edits: prepend `--model gpt-5.3-codex-spark` to the prompt content (the codex subagent parses it).
-- Default to write-capable (`--write` is the codex-rescue default).
+Spawn the existing Codex subagent via the `Agent` tool — never call `codex-companion.mjs` directly:
 
 ```
-Agent(subagent_type: "codex:codex-rescue", prompt: "<task text, optionally prefixed with --model gpt-5.3-codex-spark>")
+Agent(subagent_type: "codex:codex-rescue", prompt: "<task text, optionally prefixed with --model gpt-5.3-codex-spark for code-quick>")
 ```
+
+For `code-build` (with review): **append** this to the task text so Codex returns the Decisions block:
+
+```
+After making the changes, append a `Decisions:` block listing non-obvious choices you made (one bullet each, ≤1 line). Keep it under 8 bullets.
+```
+
+For `code-quick` (no review): no Decisions block needed — single pass.
 
 Read `~/.claude/skills/orchestrate/prompts/code-edit.md` for prompt-shape guidance.
 
-#### 2c. Claude Sonnet (`code-review`, `prose`, `judge`-vs-Opus, fallback)
+#### 2b. Opus builder (`code-build` when Opus is picked, `planning`)
 
-Spawn a Sonnet subagent via the `Agent` tool with explicit model override:
-
-```
-Agent(subagent_type: "general-purpose", model: "sonnet", description: "<2-4 word desc>", prompt: "<full self-contained task brief>")
-```
-
-Read the relevant prompts/*.md (`code-review.md` or `prose.md`) for shape. The subagent prompt must be self-contained — it doesn't see this conversation.
-
-#### 2d. Claude Opus (`planning`, `judge`-vs-Sonnet)
-
-Same as Sonnet but `model: "opus"`:
+Spawn a general-purpose subagent at Opus tier:
 
 ```
 Agent(subagent_type: "general-purpose", model: "opus", description: "<2-4 word desc>", prompt: "<full self-contained task brief>")
 ```
 
-Read `prompts/planning.md` for shape.
+The task brief MUST request a `Decisions:` block:
 
-### 3. Log the run
+```
+<the user's task, restated>
 
-Right after the dispatch returns (success or fail), log it:
-
-```bash
-bash ~/.claude/skills/orchestrate/scripts/log-run.sh '{"category":"<cat>","backend":"<ollama|codex|sonnet|opus>","model":"<model-id-or-null>","walltime_s":<float>,"ok":<true|false>,"task_hash":"<short hash>"}'
+Return:
+1. The deliverable (code with file paths / plan / spec).
+2. A short `Decisions:` block — non-obvious choices you made (≤8 bullets, one line each).
 ```
 
-Compute `task_hash` as the first 8 hex chars of `sha256(user_task_text)` (use `printf '%s' "$task" | shasum -a 256 | cut -c1-8`).
-Estimate `walltime_s` from your own clock (note time before dispatch, after).
-Set `ok` based on whether the backend returned a usable result.
+Read `prompts/code-edit.md` (build mode) or `prompts/planning.md` for shape.
 
-### 4. Return to user
+#### 2c. Ollama (`quick-lookup`) and Sonnet (`prose`, fallback)
 
-Hand the user the backend's output verbatim, prefixed with one short attribution line:
+Single-pass, no review. Same as before:
 
-> `via <backend> (<model-id-or-tier>): `
+```bash
+bash ~/.claude/skills/orchestrate/scripts/dispatch-ollama.sh "<prompt>"
+```
+or
+```
+Agent(subagent_type: "general-purpose", model: "sonnet", description: "<desc>", prompt: "<brief>")
+```
 
-Example: `via codex (gpt-5.3-codex-spark): <output>`. Do not add post-hoc commentary unless the user asks.
+Skip to step 4.
+
+### 3. Phase 2 — Cross-model review
+
+Read `~/.claude/skills/orchestrate/prompts/cross-review.md` for the reviewer brief shape. Then dispatch to the **other** model:
+
+- If Codex built → review with **Opus** subagent (`general-purpose`, `model: "opus"`).
+- If Opus built → review with **Codex** subagent (`codex:codex-rescue`, prepend `--read` so it doesn't try to edit).
+
+The reviewer prompt must be self-contained — it sees neither the conversation nor the user. Construct it as:
+
+```
+You are reviewing another model's work. Be specific, terse, and skeptical. Do not rewrite — flag.
+
+ORIGINAL TASK:
+<verbatim user request>
+
+BUILDER (<builder model name>):
+<full builder output, including the Decisions block>
+
+WHAT TO RETURN:
+1. Verdict line — one of: APPROVE | APPROVE-WITH-NOTES | BLOCKERS
+2. Numbered issue list. Tag each [blocker] / [note] / [nit].
+3. One closing sentence: "What would change my verdict to APPROVE: <specific change>." (Skip if verdict is already APPROVE.)
+
+WHAT TO FLAG:
+- Correctness errors (logic bugs, off-by-one, wrong API usage).
+- Missed requirements from the original task.
+- Edge cases the build doesn't handle.
+- Security issues (auth, input validation, injection, secrets).
+- Decisions in the Decisions block that look wrong given the task constraints.
+
+WHAT TO IGNORE:
+- Style preferences not stated in the task.
+- Naming taste.
+- Performance optimizations not asked for.
+- Suggestions to "consider" alternatives that don't address a real issue.
+```
+
+**Hard guardrail:** if Phase 1 wall-clock + Phase 2 wall-clock would exceed **5 minutes total**, return what you have at the budget cap with a partial-result note. Do not let the review run unbounded.
+
+### 4. Synthesize and return
+
+For single-pass categories (`quick-lookup`, `prose`, `code-quick`, `fallback`):
+
+```
+via <backend> (<model>): <output>
+```
+
+For build+review categories (`code-build`, `planning`, `code-review-only`, `judge`):
+
+```
+## Build (via <builder> / <model>)
+<builder output, including the Decisions block>
+
+## Review (via <reviewer> / <model>)
+<reviewer verdict line + numbered issues>
+
+## Recommendation
+<one line, derived from reviewer's verdict tags>
+```
+
+Recommendation rules (mechanical, no second-guessing):
+- Verdict `APPROVE` → "Ship as-is."
+- Verdict `APPROVE-WITH-NOTES`, all issues `[note]` or `[nit]` → "Ship; address notes when convenient."
+- Any `[blocker]` → "Address blockers before shipping."
+
+### 5. Log the runs
+
+Log Phase 1 (and Phase 2 if it ran) separately:
+
+```bash
+bash ~/.claude/skills/orchestrate/scripts/log-run.sh '{"category":"<cat>","backend":"<be>","model":"<m>","walltime_s":<f>,"ok":<bool>,"task_hash":"<8h>","phase":"build"}'
+bash ~/.claude/skills/orchestrate/scripts/log-run.sh '{"category":"<cat>","backend":"<be>","model":"<m>","walltime_s":<f>,"ok":<bool>,"task_hash":"<8h>","phase":"review","verdict":"<APPROVE|APPROVE-WITH-NOTES|BLOCKERS>"}'
+```
+
+`task_hash` is the same across both phases of one invocation: `printf '%s' "$task" | shasum -a 256 | cut -c1-8`. Wall-time is per-phase. The `verdict` field on the review entry is what V2 will use for bandit routing.
 
 ## Hard guardrails
 
-- **One dispatch per `/orchestrate` invocation.** No automatic critique/re-run loops in V1. If the result is unusable, surface that and let the user decide whether to re-route.
-- **No silent retries.** If a backend errors, log `ok:false`, tell the user, suggest the fallback. Don't loop.
-- **No host-Claude shortcuts.** If the route says Codex, you call Codex even if you "could just answer it." This skill exists to avoid that habit.
-- **Cross-model rule for `judge`**: never use the same tier for generation and judgment. Codex generated → Sonnet/Opus judges. Opus generated → Sonnet judges. Sonnet generated → Opus judges. Ollama generated → Sonnet judges.
-- **Auth-failure surfacing**: if preflight reports a backend down, copy the `.msg` field directly into your reply so the user gets the fix command verbatim.
-- **No Haiku.** Deliberately omitted from the V1 routing table — the gap between Sonnet and a small local model is small enough that Haiku doesn't earn a slot.
-- **Honor user opt-out.** If `ORCHESTRATE_DISABLED_BACKENDS` env var lists a backend (comma-separated, e.g. `codex` or `ollama,codex`), preflight already marks them `ok:false` with `msg:"disabled by user"` — treat them as unavailable and route accordingly.
+- **Builder ≠ reviewer, ever.** Codex builds → Opus reviews. Opus builds → Codex reviews. Sonnet generated → Opus reviews (or Codex). No same-model self-review even if the user asks.
+- **One build + one review per invocation.** No auto-fix loop in V1.5. If the reviewer flags blockers, surface them and stop. The user decides whether to re-dispatch with the review attached, escalate, or ship anyway.
+- **5-minute total wall-clock cap.** If reviewer hasn't returned by then, surface a partial-result note and what we have.
+- **No host-Claude shortcuts.** If the route says cross-review, you run cross-review even if you "could just answer it." This skill exists to break that habit.
+- **Auth-failure surfacing.** Copy preflight `.msg` verbatim to the user. Don't paraphrase.
+- **No Haiku.** Deliberately omitted from the routing table.
+- **Honor user opt-outs:**
+  - "just build, no review" → single dispatch (Phase 1 only).
+  - "review only what I have" → no Phase 1; dispatch to the cross-model reviewer with the user's pasted artifact.
+  - "use codex to build" / "use opus to build" → flip the auto-pick.
+  - `ORCHESTRATE_DISABLED_BACKENDS` env var → respect it; preflight already handles this.
+- **No automatic re-dispatch.** If Phase 2 says BLOCKERS, return; don't re-dispatch to Phase 1 with the review attached unless the user explicitly asks ("apply the review", "fix the blockers and re-review").
 
-## Out of scope (deferred to V2/V3 — do not do these now)
+## Out of scope (V2/V3 — do not do these now)
 
-- Auto evaluator-optimizer loops.
-- Bandit / Thompson-sampling routing from `runs.jsonl`.
-- Auto-rewriting prompt templates from accumulated failures.
-- Stuck-loop detection via hooks.
-- Session resume index.
+- **Auto-fix loop:** if reviewer flags blockers, automatically re-dispatch to builder with the review attached, capped at one fix attempt.
+- **Bandit / Thompson-sampling routing:** read `runs.jsonl` (now richer with `phase` + `verdict`) to learn which builder wins per task class.
+- **Auto-rewriting prompt templates** from accumulated failure traces.
+- **Stuck-loop detection** via `PostToolUse` hooks.
+- **Session resume index** over the JSONL transcript layer Claude Code already maintains.
 
-`runs.jsonl` is being populated for those future phases. V1 only writes; nothing reads.
+`runs.jsonl` is being populated for these phases. V1.5 only writes; nothing reads.

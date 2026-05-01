@@ -8,7 +8,7 @@ Each skill in [`skills/`](./skills) is a self-contained directory with a `SKILL.
 
 | Skill | What it does |
 |---|---|
-| [`orchestrate`](./skills/orchestrate) | Routes a task to the most cost-appropriate AI backend — Claude Opus/Sonnet via subagent, OpenAI Codex CLI, or a local Ollama model — instead of running everything on the current model. |
+| [`orchestrate`](./skills/orchestrate) | Multi-backend dispatcher with **cross-model peer review** built in. For substantive code/plan work, one model builds (auto-picked: Codex for refactors, Opus for novel features) and a *different* one reviews. Single-pass for trivial edits and one-shot text transforms. |
 | [`better-prompt`](./skills/better-prompt) | Critiques a draft prompt against a fixed rubric and returns a sharpened rewrite. One pass, up to 3 clarifying questions, no scripts required. |
 
 ## Install

@@ -1,35 +1,80 @@
 # orchestrate
 
-Multi-backend task dispatcher for Claude Code. Routes a task to the most cost-appropriate engine — Claude Opus/Sonnet via subagent, OpenAI Codex CLI, or a local Ollama model — instead of running everything on the current host model.
+Multi-backend task dispatcher for Claude Code with cross-model peer review built in. For substantive code or planning work, one model builds and a *different* one reviews — every time. The cross-review pattern is the point.
 
 ## Why
 
-When you're in a Claude Opus session, every quick lookup ("convert this list to camelCase") burns Opus tokens. Codex is genuinely better at reading and editing repo code than a Claude session with shell tools. A small local model is genuinely fast enough for one-shot text transforms, with no API cost.
+If you already use Claude and Codex side-by-side because each catches what the other misses, this skill automates the handoff. The host Claude session classifies the task, picks a builder by signal (Codex for refactor/migration/multi-file work, Opus for novel features and design-shaped logic), dispatches, then sends the build to the *other* model for review. You get a build + a verdict + a one-line recommendation in one invocation.
 
-The host Claude session classifies the task, dispatches to the right backend, logs the run, and returns the result with a one-line attribution. Future versions will read the run log to learn routing preferences over time.
+For trivial mechanical edits and one-shot text transforms, the skill stays single-pass — review overhead would exceed the catch rate.
 
-## What's wired up (V1)
+## What's wired up (V1.5)
 
-| Category | Backend | Notes |
-|---|---|---|
-| `quick-lookup` | Ollama (local) | Regex, format conversion, single-fact extraction. Configured via `OLLAMA_MODEL`. |
-| `code-edit-narrow` | Codex CLI (`gpt-5.3-codex-spark`) | Single-file mechanical edits. |
-| `code-edit-broad` | Codex CLI (default model) | Multi-file refactors, feature implementation. |
-| `code-review` | Sonnet subagent | Read-mostly judgment. |
-| `prose` | Sonnet subagent | Polished human-readable text. |
-| `planning` | Opus subagent | Architecture, design, multi-step plans. |
-| `judge` | Cross-tier subagent (different model than generator) | Second-opinion review. |
+| Category | Phase 1 (build) | Phase 2 (review) | When |
+|---|---|---|---|
+| `quick-lookup` | Ollama (local model) | none | one-shot text transforms |
+| `prose` | Sonnet | none | polished human-readable text |
+| `code-quick` | Codex spark | none | trivial mechanical edits ≤30 LoC |
+| `code-build` | **auto-pick: Opus or Codex** | the other | substantive code work — default for real coding |
+| `planning` | Opus | Codex | design, architecture, PRDs, multi-step plans |
+| `code-review-only` | n/a | cross-model | review an artifact you already have |
+| `judge` | n/a | cross-model | explicit second-opinion request |
+| fallback | Sonnet | none | unclassifiable |
 
-No Haiku. The gap between Sonnet and a small local model is small enough that Haiku doesn't earn a slot.
+**Auto-pick rules for `code-build`:**
+- Refactor / migration / port / multi-file consistency / mass edits → **Codex builds**, Opus reviews.
+- Novel feature / algorithm / design-shaped / single-file high-novelty → **Opus builds**, Codex reviews.
+- Borderline → Opus builds, Codex reviews (default toward reasoning).
+- "use codex to build" / "use opus to build" — user override always wins.
+
+**Cross-model rule (load-bearing):** builder ≠ reviewer, ever. Same-model self-review is documented to be misleading (position bias, verbosity bias, self-preference bias). If only one of Codex/Opus is reachable and the route needs cross-review, the skill falls back to single-pass with a clear "review unavailable" note rather than fake-reviewing with the same model.
 
 ## Usage
 
 Explicit:
 ```
-/orchestrate "convert these snake_case names to camelCase: foo_bar, baz_qux"
+/orchestrate "implement a sliding-window rate limiter for our Express API, per-tenant, no new deps"
 ```
 
-The skill also auto-triggers on phrases like "use the right model for…", "save Opus tokens on…", "use codex for this", "run on ollama". See [`SKILL.md`](./SKILL.md) for the full description.
+Auto-trigger phrases the skill responds to: "use the right model for…", "have codex review", "second pair of eyes", "build this and have <other> check it", "use codex for this", "run on ollama", "use opus to plan".
+
+User opt-outs:
+- `"just build, no review"` → single-pass.
+- `"review what I have"` → no Phase 1, paste the artifact.
+- `"use codex to build"` / `"use opus to build"` → flip the auto-pick.
+
+## Output shape
+
+Single-pass categories return a one-line attribution + the result:
+```
+via codex (gpt-5.3-codex-spark): <output>
+```
+
+Build+review categories return three sections:
+```
+## Build (via opus)
+<code or plan, including the Decisions block>
+
+## Review (via codex)
+Verdict: APPROVE-WITH-NOTES
+1. [note] Edge case: empty tenant ID falls through to the global cap silently.
+2. [nit] `lruCache` import is unused.
+What would change my verdict to APPROVE: handle empty tenant ID explicitly (reject or fall to anon bucket).
+
+## Recommendation
+Ship; address notes when convenient.
+```
+
+The recommendation line is mechanical:
+- `APPROVE` → "Ship as-is."
+- `APPROVE-WITH-NOTES` → "Ship; address notes when convenient."
+- Any `[blocker]` → "Address blockers before shipping."
+
+## Cost honesty
+
+Build+review doubles the per-dispatch cost on substantive code work (two LLM calls instead of one). If your manual workflow is "Claude builds, Codex reviews" anyway, this is the cost you're already paying — just automated and consistent. For trivial edits, the skill stays single-pass; you're not paying for a review where it doesn't earn its keep.
+
+The 5-minute total wall-clock cap protects against a slow reviewer. If Phase 2 is still running at the cap, the skill returns what it has with a partial-result note.
 
 ## Install
 
@@ -51,56 +96,60 @@ Required:
 - `bash`, `curl`, `jq`
 - Claude Code (the dispatcher)
 
-Optional (skill degrades gracefully when missing):
-- [Codex CLI plugin](https://github.com/openai/codex) — install via `/plugins` → `codex@openai-codex`. Without it, `code-edit-*` falls back to Sonnet.
-- [Ollama](https://ollama.com) with at least one instruction-tuned model pulled. Without it, `quick-lookup` falls back to Sonnet.
+For full cross-review on `code-build` and `planning`:
+- [Codex CLI plugin](https://github.com/openai/codex) — install via `/plugins` → `codex@openai-codex`. Without it, those categories fall back to Opus single-pass with a "review unavailable" note.
+- `node` (>=18) — Codex CLI dependency.
+
+Optional:
+- [Ollama](https://ollama.com) with at least one instruction-tuned model pulled (e.g. `ollama pull gemma3:4b`). Without it, `quick-lookup` falls back to Sonnet.
 
 ## Configuration
 
-All configuration via environment variables (no config file).
+All via environment variables; no config file.
 
 | Var | Default | Effect |
 |---|---|---|
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama daemon URL |
 | `OLLAMA_MODEL` | `gemma3:4b` | Local model for `quick-lookup` |
 | `OLLAMA_TIMEOUT_S` | `30` | Per-dispatch budget |
-| `CODEX_PLUGIN_ROOT` | autodiscovered | Override Codex path if you've relocated the plugin |
+| `CODEX_PLUGIN_ROOT` | autodiscovered | Override Codex path if relocated |
 | `ORCHESTRATE_DISABLED_BACKENDS` | empty | Comma list to opt out: `codex`, `ollama`, or both |
 
 ## Files
 
 ```
 skills/orchestrate/
-├── SKILL.md           # what Claude reads — routing protocol
-├── routing.md         # category → backend table (referenced by SKILL.md)
-├── README.md          # this file
-├── preflight.sh       # auth + liveness check, cached 5min
+├── SKILL.md            # protocol Claude reads
+├── routing.md          # category → backend, auto-pick rules
+├── README.md           # this file
+├── preflight.sh        # backend auth + liveness, cached 5min
 ├── scripts/
 │   ├── dispatch-ollama.sh
 │   └── log-run.sh
 └── prompts/
     ├── quick-lookup.md
-    ├── code-edit.md
-    ├── code-review.md
-    ├── planning.md
-    └── prose.md
+    ├── prose.md
+    ├── code-edit.md       # code-quick + code-build (with Decisions block)
+    ├── planning.md        # build + cross-review note
+    ├── code-review.md     # for code-review-only
+    └── cross-review.md    # the reviewer brief shape (Phase 2)
 ```
 
-State (per-machine, never committed) lives at `~/.claude/orchestrate/`:
-- `preflight.json` — last preflight result, 5min TTL
-- `runs.jsonl` — append-only dispatch log
+State at `~/.claude/orchestrate/`:
+- `preflight.json` — last preflight result, 5min TTL.
+- `runs.jsonl` — append-only dispatch log; entries now include `phase: "build"|"review"` and the reviewer's `verdict` field, which V2 will use for bandit routing.
 
 ## Roadmap
 
 V2:
-- Cross-model evaluator-optimizer loop (max 3 iterations, hard cost cap)
-- Hook-based stuck-loop detection
-- Wall-clock + $/task budget caps
+- **Auto-fix loop (capped)** — if the reviewer flags blockers, automatically re-dispatch to the builder with the review attached, max one fix attempt, then stop.
+- **Hook-based stuck-loop detection** via `PostToolUse`.
+- **Cost / wall-clock budget caps** beyond the current 5-min hard cap (per-task $-budget).
 
 V3:
-- Bandit (Thompson sampling) over `(category, backend, prompt-variant) → success`
-- Auto-rewriting prompt templates from accumulated failure traces
-- Session resume index
+- **Bandit routing** (Thompson sampling) over `(category, builder, reviewer) → verdict-rate` from the richer `runs.jsonl`.
+- **Auto-rewriting prompt templates** from accumulated failure traces.
+- **Session resume index** over the JSONL transcript layer Claude Code already maintains.
 
 See [`docs/design-orchestrate.md`](../../docs/design-orchestrate.md) for the architectural rationale.
 

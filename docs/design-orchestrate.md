@@ -2,16 +2,27 @@
 
 Architectural rationale for the orchestrate skill. Why the routing table looks the way it does, why certain things were deliberately left out, and what comes next.
 
-## The pattern: orchestrator-worker
+## V1 → V1.5 — what changed and why
 
-This skill implements Anthropic's [orchestrator-worker pattern](https://www.anthropic.com/research/building-effective-agents): a central LLM (the host Claude session) classifies the task, delegates it to a worker (a subagent or external CLI), and synthesizes the result.
+The first cut of this skill was scoped as a thin task router: classify the task, dispatch to one backend, return. That framing missed the actual value.
 
-What makes it useful here, specifically:
-- **Host session is usually Claude Opus.** Every task that doesn't need Opus burns Opus tokens unnecessarily.
-- **Codex is genuinely better at code editing.** It reads the repo natively, maintains a working set across files, and writes patches — things a Claude session with `Read`/`Edit` tools approximates but doesn't excel at.
-- **Local models are genuinely fast for one-shots.** A 4B-param model on Apple Silicon answers a `convert these to camelCase` request in <1s with no API cost.
+**What changed in V1.5:** for substantive code or planning work, the skill now runs a **build phase + cross-model review phase** as standard, not as a deferred V2 feature. The pattern users actually run by hand — "Claude builds, Codex reviews" or vice versa — is now baked in. Single-pass remains for trivial code edits and one-shot text transforms where review overhead exceeds the catch rate.
 
-The skill is essentially a routing policy. It doesn't add capability — it picks the best capability per task.
+**Why this is the right framing:** picking one of three backends is a routing decision; the *value* of having three different model families on tap is that they have different blind spots. Cross-model review captures that value. Single-backend dispatch wastes it. Anthropic's own [orchestrator-worker + evaluator-optimizer combination](https://www.anthropic.com/research/building-effective-agents) describes exactly this composition.
+
+## The pattern: orchestrator-worker + evaluator-optimizer
+
+The skill implements two of Anthropic's effective-agent patterns composed together:
+
+1. **Orchestrator-worker** — a central LLM (the host Claude session) classifies the task and delegates to a worker (a subagent or external CLI). This handles *which model builds*.
+2. **Evaluator-optimizer** — a different model evaluates the worker's output against the task. This handles *which model reviews*.
+
+What makes the composition useful here, specifically:
+- **Host session is usually Claude Opus.** Every task that doesn't need Opus burns Opus tokens unnecessarily — but more importantly, Opus reviewing its own output is misleading (self-preference bias). Cross-model review side-steps both problems.
+- **Codex and Opus have complementary strengths.** Codex is stronger at multi-file edit volume and repo navigation; Opus is stronger at reasoning-shaped novel logic. Pairing them — one builds, the other reviews — catches what each individually misses.
+- **Local models are genuinely fast for one-shots.** A 4B-param model on Apple Silicon answers a `convert these to camelCase` request in <1s with no API cost. No review phase — review overhead exceeds catch rate at this size.
+
+The skill is a routing-and-review policy. It doesn't add capability — it picks the best capability per task and pressure-tests the output with a different perspective.
 
 ## Why no Haiku
 
@@ -32,14 +43,16 @@ The LLM-as-judge literature (2024-2025) documents three biases that destroy sing
 
 The fix is straightforward: never use the same tier for generation and judgment. The skill's `judge` route enforces this — Opus generated → Sonnet judges, and so on. Same-model judging is a documented trap; allowing it would silently bias every evaluation.
 
-## Why no automatic critique loop in V1
+## Why one review pass, not a loop
 
-Multi-agent debate and self-refine loops are appealing on paper, but the empirical 2025 finding is sobering: a single model with more compute often beats a multi-agent debate at the same total budget. Critique loops earn their cost only when:
+V1.5 runs **exactly one** build + one review per invocation. No iterative refine-and-rescore.
+
+Multi-agent debate and self-refine loops are appealing on paper, but the empirical 2025 finding is sobering: a single model with more compute often beats a multi-agent debate at the same total budget. Iterative critique loops earn their cost only when:
 - The task has clear external success criteria (so the evaluator isn't just hallucinating preferences).
 - The generator's first attempt has measurable room to improve (often it doesn't).
 - The cost ceiling is enforced, otherwise the loop runs forever on coherent-but-wrong outputs.
 
-V2 will add the loop with explicit guardrails: cross-model judge, max 3 iterations, hard cost cap. Until then, the user can manually invoke `judge` as a separate dispatch.
+A *single* cross-model review captures most of the gain documented in the literature — it forces the build through a different perspective once. Adding round-trips multiplies cost and latency without proportional improvement, and risks stabilizing on coherent-but-wrong outputs (the documented failure mode of self-refine loops). V2 will add an **auto-fix** loop (capped at one fix attempt) for the case where the user wants the skill to act on blockers automatically; iterative debate is intentionally not on the roadmap.
 
 ## Why file-based state
 
@@ -54,10 +67,11 @@ Reasons:
 
 The downside: querying gets expensive at scale. At ~1KB per line, a year of heavy use is ~10MB — easily handled by the `jq | sort` pattern. If a skill's run log ever exceeds 100MB, that's the signal to introduce SQLite, not before.
 
-## What V1 deliberately doesn't do
+## What V1.5 deliberately doesn't do
 
-- **No automatic prompt-template tuning.** The five `prompts/*.md` files are hand-written and static in V1. V3 will spawn an Opus "meta" subagent that reads accumulated failures and proposes new template versions — but only after the run log has enough signal to ground the rewrite.
-- **No bandit routing.** Thompson sampling over `(category, backend, prompt-variant)` arms needs ~50 trials per arm to outperform random — premature in V1. The infrastructure (run log) is built; the bandit isn't.
+- **No auto-fix loop.** If the reviewer flags `[blocker]` issues, the skill surfaces them and stops. V2 will add a one-shot auto-fix (re-dispatch to builder with the review attached, capped at one attempt). For now: surface, stop, let the user decide.
+- **No automatic prompt-template tuning.** The `prompts/*.md` files are hand-written and static. V3 will spawn an Opus "meta" subagent that reads accumulated failures and proposes new template versions — but only after the run log (which now includes per-phase entries with the reviewer's verdict tags) has enough signal to ground the rewrite.
+- **No bandit routing.** Thompson sampling over `(category, builder, reviewer) → verdict-rate` needs ~50 trials per arm to outperform random — premature now. The infrastructure (richer per-phase run log) is built; the bandit isn't.
 - **No hook-based stuck detection.** Hooks belong in `~/.claude/settings.json` and would touch global config. V2 will add a `PostToolUse` hook that fingerprints `(tool, args, result_hash)` over a rolling window and aborts on three identical calls.
 - **No session resume index.** Claude Code already persists session transcripts as JSONL under `~/.claude/projects/`. The skill's job, when V3 adds resume, is to maintain a thin index over those transcripts — not to reinvent the persistence layer.
 
