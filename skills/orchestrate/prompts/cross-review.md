@@ -12,7 +12,7 @@ You are reviewing another model's work. Be specific, terse, and skeptical. Do no
 ORIGINAL TASK:
 <verbatim user request, no paraphrase>
 
-BUILDER (<builder model name, e.g. "opus" or "codex (gpt-5.3-codex)">):
+BUILDER (<builder model name, e.g. "opus" or "codex (gpt-5.5-codex)">):
 <full builder output — code/plan AND the Decisions block>
 
 WHAT TO RETURN:

@@ -47,7 +47,7 @@ User opt-outs:
 
 Single-pass categories return a one-line attribution + the result:
 ```
-via codex (gpt-5.3-codex-spark): <output>
+via codex (gpt-5.5-codex-spark): <output>
 ```
 
 Build+review categories return three sections:

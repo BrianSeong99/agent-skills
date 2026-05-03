@@ -9,7 +9,7 @@ For trivial mechanical edits where review overhead exceeds the catch rate. Singl
 State the change in plain English; name files/symbols Codex should touch. Codex reads the repo on its own — don't paste code.
 
 ```
---model gpt-5.3-codex-spark
+--model gpt-5.5-codex-spark
 Rename the variable `tmp` to `scratch` in src/utils/parse.ts. Update every reference inside that file. Don't touch other files.
 ```
 

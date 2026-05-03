@@ -18,7 +18,7 @@ Single source of truth for category → backend mapping. SKILL.md mirrors this; 
 ### `code-quick` → Codex spark, single pass
 **Signals:** single-file mechanical edit / rename a variable / fix a typo / add an import / remove a console.log / fix a single failing test. Edit pattern is obvious from the request, ≤30 LoC change. Reviewer overhead exceeds catch rate at this size.
 **Anti-signals:** anything that needs design judgment, anything multi-file.
-**Builder:** `Agent(subagent_type: "codex:codex-rescue", prompt: "--model gpt-5.3-codex-spark <task>")`.
+**Builder:** `Agent(subagent_type: "codex:codex-rescue", prompt: "--model gpt-5.5-codex-spark <task>")`.
 **No review.**
 
 ### `code-build` → cross-review (Opus or Codex builds, the other reviews)

@@ -31,7 +31,7 @@ Read `~/.claude/skills/orchestrate/routing.md`. Pick exactly one category:
 |---|---|---|
 | `quick-lookup` | Ollama (local model) | none |
 | `prose` | Sonnet | none |
-| `code-quick` | Codex spark (`--model gpt-5.3-codex-spark --write`) | none |
+| `code-quick` | Codex spark (`--model gpt-5.5-codex-spark --write`) | none |
 | `code-build` | **auto-pick: Opus OR Codex** by signal (see routing.md) | the other one |
 | `planning` | **Opus** | Codex |
 | `code-review-only` | n/a (artifact already exists) | cross-model from generator |
@@ -53,7 +53,7 @@ Dispatch to the builder. The builder must include a `Decisions:` block in its ou
 Spawn the existing Codex subagent via the `Agent` tool — never call `codex-companion.mjs` directly:
 
 ```
-Agent(subagent_type: "codex:codex-rescue", prompt: "<task text, optionally prefixed with --model gpt-5.3-codex-spark for code-quick>")
+Agent(subagent_type: "codex:codex-rescue", prompt: "<task text, optionally prefixed with --model gpt-5.5-codex-spark for code-quick>")
 ```
 
 For `code-build` (with review): **append** this to the task text so Codex returns the Decisions block:
