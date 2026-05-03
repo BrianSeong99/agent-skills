@@ -65,6 +65,14 @@ The cross-review here is non-negotiable: a plan reviewed only by its author is a
 **Signals:** user explicitly asks for a second opinion / cross-check / "what does codex think" / "have opus look at this".
 **Same as `code-review-only` but the user is explicitly invoking the cross-model rule.** Honor their request literally — if they say "have codex look at this opus output", you do exactly that.
 
+### `code-fanout` (V2) → N codex runs in parallel, one Opus review per completed run
+**Signals:** explicit `/orchestrate --fanout <id1> <id2> …`, or trigger phrases like "fan out M4.32 M4.33 M4.34", "spawn N codex runs in parallel for these tasks", "kick off these milestones in parallel". The user has already chunked the work into named, independent milestones.
+**Anti-signals:** one big task that *could* be split — not your call to split it. A serial dependency chain ("M2 needs M1's output") — that's a stack, run it serially as `code-build`.
+**Builder:** `codex` per milestone, spawned via `scripts/fanout-spawn.sh`, capped at `ORCHESTRATE_FANOUT_CAP` (default 4) in flight.
+**Reviewer:** Opus, one review pass **per completed run**. Cross-model rule applies per run, not collectively.
+**State:** `~/.claude/orchestrate/fanout-state.json` tracks pid + log path per id. `fanout-check.sh` reports liveness and flags stuck runs (log mtime older than `ORCHESTRATE_STUCK_AFTER_S`, default 300s). `fanout-reap.sh` records PR linkage.
+**Prompt shape:** see `prompts/fanout.md` — every per-milestone brief must be self-contained, list acceptance criteria, and request a Decisions block (the Opus reviewer is the only peer-eyes the build will get).
+
 ### fallback → Sonnet, single pass
 **When:** unclassifiable, no signal matches.
 **Why Sonnet:** safe middle. Cheaper than Opus, doesn't pretend to be a coding specialist.
@@ -73,21 +81,24 @@ The cross-review here is non-negotiable: a plan reviewed only by its author is a
 ## Decision algorithm
 
 1. **User pinned a backend explicitly?** Honor it. ("use codex" → Codex builds; "review with opus" → Opus reviews.) Skip auto-classification.
-2. **User asked for no review?** ("just build", "no review", "skip the cross-check") → single-pass, no Phase 2. Set category accordingly (`code-build` becomes single-pass-Opus or single-pass-Codex by user's pick).
-3. **User asked for review-only?** ("review this", "find issues in") → `code-review-only`, no Phase 1.
-4. Otherwise, walk the categories above top-to-bottom. Pick the first whose signals match. Ties → cheaper backend.
-5. **Stakes override:** if the task is irreversible (writes to main, sends a message, modifies prod config), upgrade one tier. `code-quick` → `code-build` (so it gets reviewed). Never downgrade.
-6. **Availability override:** if the chosen backend is `ok:false` in preflight, fall through:
+2. **User invoked `--fanout` or said "fan out X Y Z"?** → `code-fanout`. Skip auto-classification; the user has already chunked the work.
+3. **User asked for no review?** ("just build", "no review", "skip the cross-check") → single-pass, no Phase 2. Set category accordingly (`code-build` becomes single-pass-Opus or single-pass-Codex by user's pick).
+4. **User asked for review-only?** ("review this", "find issues in") → `code-review-only`, no Phase 1.
+5. Otherwise, walk the categories above top-to-bottom. Pick the first whose signals match. Ties → cheaper backend.
+6. **Stakes override:** if the task is irreversible (writes to main, sends a message, modifies prod config), upgrade one tier. `code-quick` → `code-build` (so it gets reviewed). Never downgrade.
+7. **Availability override:** if the chosen backend is `ok:false` in preflight, fall through:
    - Codex down + `code-build`: try Opus single-pass with a "review unavailable" note.
    - Opus down + `code-build`: try Codex single-pass with a "review unavailable" note.
    - Both down: refuse with the fix commands surfaced from `preflight.json`.
-7. **Wall-clock budget:** 5 min total per invocation. If Phase 2 hasn't returned by the cap, surface what we have.
+8. **Wall-clock budget:** 5 min total per single-pass invocation. Fan-out cohorts are *not* 5min-capped (would defeat the purpose); they rely on per-run stuck-detection instead.
+9. **Budget-cap override (V2):** if `ORCHESTRATE_BUDGET_USD` is set and `budget-check.sh` says spend would exceed it, abort with a user-facing message; do not proceed to dispatch.
 
 ## What is NOT in the table
 
 - **Haiku.** Deliberately omitted.
-- **Auto-fix loops.** V1.5 surfaces blockers and stops; the user re-dispatches with the review attached if they want a fix pass.
+- **Unbounded auto-fix loops.** V2 ships **one capped fix attempt** behind `--auto-fix` / `ORCHESTRATE_AUTO_FIX=1`. Even if the second review still says BLOCKERS, the skill stops. No multi-round refinement.
 - **Multi-round debate.** The literature shows single-cross-review captures most of the gain; more rounds add cost without clear win.
+- **Cross-cohort review for fan-out.** Each fan-out run gets its own Opus review pass. There's no global "review the cohort" pass — that's reduce-by-LLM, which the literature flags as biased.
 - **Sonnet as a code reviewer.** When `code-build` or `planning` needs review, the reviewer is Codex or Opus — both are above Sonnet for code/plan judgment. Sonnet stays in `prose` and `fallback`.
 - **Multiple Ollama models simultaneously.** One model per session via `OLLAMA_MODEL`.
 

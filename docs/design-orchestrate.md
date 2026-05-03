@@ -97,3 +97,74 @@ The patterns this skill leans on, with sources:
 - **LLM-as-judge biases:** position bias, verbosity bias, self-preference bias — multiple 2024-2025 papers (e.g. [Wang et al., "Large Language Models are not Fair Evaluators"](https://arxiv.org/abs/2305.17926)).
 - **Stuck-loop fingerprinting:** standard ops pattern — fingerprint `(tool, args, result)` over a rolling window, abort on N identical calls.
 - **Bandit routing:** Thompson sampling over arms; ~50 trials/arm to outperform random.
+
+## V1.5 → V2.0 — what changed and why
+
+V2 is **purely additive**. Every V1.5 dispatch path still works, identical shape. Four features land:
+
+### 1. Parallel fan-out (`code-fanout`)
+
+**Why this exists.** The session record across the last few weeks of work shows the same hand-rolled pattern over and over: 42 milestone-numbered codex runs in one Chainless week, 28 in one Miden bridge-build session. Each one was a separate `codex exec` invocation, with PID/log bookkeeping in `/tmp/m<N>-codex.log` and `/tmp/codex_pr<N>_prompt.md`. The skill now does that bookkeeping in one place.
+
+**Design choices:**
+
+- **Cap-N-in-flight, not unbounded.** `ORCHESTRATE_FANOUT_CAP` (default 4) keeps the cohort honest. Codex `--full-auto` is heavy on local CPU + network; running 12 in parallel just queues them at OS-level. Four is empirically the most a Mac Studio can drive without one of them starving on tool round-trips.
+- **One Opus review per run, not collective.** Cross-model rule applies at the run level. Reviewing the cohort as a whole would be reduce-by-LLM, which the bias literature flags as fragile (the reduction step inherits self-preference effects when the reducer model is the same family as the dominant builder).
+- **Stuck detection via log mtime, not via pid heartbeat.** Codex doesn't expose a heartbeat; pid liveness is necessary but not sufficient (a hung child still has a live pid). The actual signal is "log file hasn't grown in a while" — `stat -f %m` on `/tmp/codex_<id>.log` is the cheapest reliable proxy. Default threshold is 5min; configurable via `ORCHESTRATE_STUCK_AFTER_S`.
+- **Surface, don't kill.** A long pause might be a long-running test. The skill flags stuck runs and tells the user; the user decides. Auto-kill is the wrong default — wrong-kill is worse than wrong-flag.
+- **State is a JSON array, not JSONL.** Unlike `runs.jsonl` which is append-only, `fanout-state.json` is mutable per-entry (status transitions). Atomic write via `mktemp + mv` works at this size; anything bigger and we'd need SQLite, but a cohort is rarely >20 entries.
+
+### 2. Capped auto-fix (one attempt)
+
+**Why this exists.** Brian's 2026-04-30 explicit ask: "have codex review and adapt feedbacks until satisfactory." The "until satisfactory" framing is the dangerous part — left unbounded, this stabilizes on coherent-but-wrong outputs (the documented self-refine failure mode). V2 ships the loop **with a hard cap of one attempt**.
+
+**Design choices:**
+
+- **Same builder for the fix.** When Codex was the original builder, Codex retries with the Opus review attached. The reviewer's role is to flag, the builder's role is to fix; switching builders mid-loop loses the original's working set and decisions.
+- **Fresh cross-model review on the fix.** Critically, the fix attempt does NOT skip review. It gets a brand-new cross-model review pass; the second-review verdict is what surfaces. Otherwise the loop becomes builder-only refinement, which is exactly the self-bias trap.
+- **Hard cap at one.** Even if the second review still says BLOCKERS, the skill stops. The user decides whether to escalate, restart, or ship anyway. The empirical evidence on multi-round refine (2025) says round 2+ rarely helps and often hurts.
+- **Logged distinctly.** `phase: "build-fix"` and `phase: "review-fix"` mark the retry in `runs.jsonl` so V3's bandit can learn whether auto-fix actually changed verdicts on average.
+
+### 3. Hook-based stuck-loop detection in settings.json
+
+**Why this lives in settings.json, not SKILL.md.** [anthropics/claude-code#19225](https://github.com/anthropics/claude-code/issues/19225) documents that Stop and PostToolUse hooks declared inside a SKILL.md don't fire — the harness only loads hooks defined in `~/.claude/settings.json` (or the project-local equivalent). We can't paper over this from inside the skill; we ship an idempotent installer instead.
+
+**Design choices:**
+
+- **Idempotent install.** `install-hook.sh` looks for our marker key (`_orchestrate_marker: "orchestrate-stuck-loop"`) inside any existing PostToolUse entry. Re-running is a no-op unless `--force` is passed.
+- **Co-existence with other hooks.** The installer never touches non-orchestrate entries. `uninstall-hook.sh` filters by the same marker; nothing else gets touched.
+- **`--dry-run` for review.** The installer prints the JSON it would write without modifying settings.json. This is how the skill teaches users what's about to land in their global config.
+- **Fingerprint over a 3-call window.** The hook hashes `(tool_name, canonical(tool_input), sha256(tool_response).head)` and rolls a 3-line window in `~/.claude/orchestrate/stuck-window.jsonl`. Three identical fingerprints = warning. Three is the smallest window where "twice" doesn't trigger on legitimate retry-on-flake patterns; bigger windows (5+) miss real stuck loops because the harness has often already burned a lot of tokens.
+- **Surface via `additionalContext`, don't block.** The hook returns a JSON object that Claude Code's harness reads to inject a system message into the next turn. This is non-blocking — Claude can still proceed, but it sees the warning. Outright blocking would fight cases where the user actually wants 3 identical calls (e.g., polling).
+
+### 4. Per-task USD budget cap
+
+**Why this exists.** Build+review doubles cost per dispatch on substantive code; `--auto-fix` doubles it again on blockers; fan-out multiplies by N. A 12-milestone fan-out with auto-fix can rack up real money without anyone watching. The 5-min wall-clock cap doesn't catch this — money runs out before time does on Opus.
+
+**Design choices:**
+
+- **Off by default.** `ORCHESTRATE_BUDGET_USD` unset = no cap. Existing users see no behavior change.
+- **Per task_hash, not global.** The cap scopes to a single task (whatever invocation produced the hash). Cross-task accounting belongs in real billing, not in this guardrail.
+- **Pre-dispatch check.** `budget-check.sh <hash> --estimate <usd>` exits 1 if the next dispatch would push spend past the cap. The skill aborts with the user-facing message "Budget cap hit for this task. Spent $X/$Y. Re-run with `ORCHESTRATE_BUDGET_USD=<higher>` to continue."
+- **Rough heuristic, not accounting.** The estimate is per-dispatch, not per-token. Real costs come from the Anthropic + OpenAI billing dashboards. The cap is a "stop the runaway" guardrail; over/undershoot of ~30% is acceptable.
+
+## V2 schema additions to `runs.jsonl`
+
+All optional, all default-coalesced by readers:
+
+| Field | Type | When |
+|---|---|---|
+| `cost_usd_estimate` | number | Per-dispatch cost estimate. Used by `budget-check.sh`. |
+| `stuck_flagged` | bool | True if the dispatch was flagged stuck by `fanout-check.sh` at some point. |
+| `fanout_id` | string | Milestone id for `code-fanout` entries. Ties build + review entries together. |
+
+V1.5-shape entries (no V2 fields) still parse correctly; the new fields are pure addition. `log-run.sh` requires no changes — it already passes through whatever JSON the caller hands it.
+
+## Why no auto-merge or post-fanout reduce step
+
+After a fan-out cohort completes, there's a tempting next step: have Opus read all N reviews and produce a "cohort verdict" or auto-merge the green ones. We deliberately don't.
+
+- **Auto-merge crosses a safety boundary.** Merging is irreversible-ish; the skill is read-and-review by design. PRs exist to be reviewed by humans. The skill stops at "PR opened, here's the cross-review."
+- **A cohort-level reducer reintroduces single-judge bias.** The whole point of cross-review is that builder ≠ reviewer. A cohort-reducer that re-reads N (Codex build, Opus review) pairs is itself a single Opus pass — which means it has Opus's biases at the cohort level. We reject the reduction.
+
+If the user wants a cohort-level summary, they can ask the host session for one explicitly. The skill won't impose it.
