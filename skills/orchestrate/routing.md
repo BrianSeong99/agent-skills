@@ -19,6 +19,7 @@ Single source of truth for category → backend mapping. SKILL.md mirrors this; 
 **Signals:** single-file mechanical edit / rename a variable / fix a typo / add an import / remove a console.log / fix a single failing test. Edit pattern is obvious from the request, ≤30 LoC change. Reviewer overhead exceeds catch rate at this size.
 **Anti-signals:** anything that needs design judgment, anything multi-file.
 **Builder:** `Agent(subagent_type: "codex:codex-rescue", prompt: "--model gpt-5.5-codex-spark <task>")`.
+**Network footnote:** use this plugin path only for file-only/offline tasks. If success depends on network access (`git push`, `gh`, web fetches, package downloads, or recursive `codex` calls), route through raw `codex exec --dangerously-bypass-approvals-and-sandbox` on the host and verify remote state separately.
 **No review.**
 
 ### `code-build` → cross-review (Opus or Codex builds, the other reviews)
@@ -82,6 +83,10 @@ The cross-review here is non-negotiable: a plan reviewed only by its author is a
    - Opus down + `code-build`: try Codex single-pass with a "review unavailable" note.
    - Both down: refuse with the fix commands surfaced from `preflight.json`.
 7. **Wall-clock budget:** 5 min total per invocation. If Phase 2 hasn't returned by the cap, surface what we have.
+
+### Codex network caveat
+
+The `codex:codex-rescue` plugin path is for offline repo work. For tasks that need GitHub, URL fetches, package downloads, or nested Codex execution, dispatch raw `codex exec --dangerously-bypass-approvals-and-sandbox` from the host and verify with host commands such as `git log origin/<branch>`, `gh issue view`, or `gh pr list` before declaring completion.
 
 ## What is NOT in the table
 
