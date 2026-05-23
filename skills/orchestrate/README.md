@@ -8,7 +8,7 @@ If you already use Claude and Codex side-by-side because each catches what the o
 
 For trivial mechanical edits and one-shot text transforms, the skill stays single-pass — review overhead would exceed the catch rate.
 
-## What's wired up (V1.5)
+## What's wired up (V2.0)
 
 | Category | Phase 1 (build) | Phase 2 (review) | When |
 |---|---|---|---|
@@ -19,6 +19,7 @@ For trivial mechanical edits and one-shot text transforms, the skill stays singl
 | `planning` | Opus | Codex | design, architecture, PRDs, multi-step plans |
 | `code-review-only` | n/a | cross-model | review an artifact you already have |
 | `judge` | n/a | cross-model | explicit second-opinion request |
+| `code-fanout` (V2) | N codex runs in parallel | one Opus review **per** completed run | user has chunked work into ≥3 named, independent milestones |
 | fallback | Sonnet | none | unclassifiable |
 
 **Auto-pick rules for `code-build`:**
@@ -36,12 +37,14 @@ Explicit:
 /orchestrate "implement a sliding-window rate limiter for our Express API, per-tenant, no new deps"
 ```
 
-Auto-trigger phrases the skill responds to: "use the right model for…", "have codex review", "second pair of eyes", "build this and have <other> check it", "use codex for this", "run on ollama", "use opus to plan".
+Auto-trigger phrases the skill responds to: "use the right model for…", "have codex review", "second pair of eyes", "build this and have <other> check it", "use codex for this", "run on ollama", "use opus to plan", "fan out M4.32 M4.33 M4.34", "spawn N codex runs in parallel".
 
-User opt-outs:
+User opt-outs and modifiers:
 - `"just build, no review"` → single-pass.
 - `"review what I have"` → no Phase 1, paste the artifact.
 - `"use codex to build"` / `"use opus to build"` → flip the auto-pick.
+- `--fanout <id1> <id2> …` (V2) → parallel cohort of codex builds, one Opus review per completed run.
+- `--auto-fix` or `ORCHESTRATE_AUTO_FIX=1` (V2) → on a BLOCKERS verdict, run one capped fix attempt and a fresh cross-model review over the fix.
 
 ## Output shape
 
@@ -114,6 +117,10 @@ All via environment variables; no config file.
 | `OLLAMA_TIMEOUT_S` | `30` | Per-dispatch budget |
 | `CODEX_PLUGIN_ROOT` | autodiscovered | Override Codex path if relocated |
 | `ORCHESTRATE_DISABLED_BACKENDS` | empty | Comma list to opt out: `codex`, `ollama`, or both |
+| `ORCHESTRATE_FANOUT_CAP` (V2) | `4` | Max concurrent codex runs in a fan-out cohort |
+| `ORCHESTRATE_STUCK_AFTER_S` (V2) | `300` | Seconds-without-log-output before a fan-out run is flagged stuck |
+| `ORCHESTRATE_AUTO_FIX` (V2) | unset | When `=1`, behaves as if `--auto-fix` was passed (one capped fix attempt on BLOCKERS) |
+| `ORCHESTRATE_BUDGET_USD` (V2) | unset | Per-task USD cap. When set, `budget-check.sh` aborts dispatches that would exceed the cap. |
 
 ## Files
 
@@ -125,29 +132,48 @@ skills/orchestrate/
 ├── preflight.sh        # backend auth + liveness, cached 5min
 ├── scripts/
 │   ├── dispatch-ollama.sh
-│   └── log-run.sh
+│   ├── log-run.sh
+│   ├── fanout-spawn.sh        # V2: spawn one codex run, record state
+│   ├── fanout-check.sh        # V2: report status + stuck detection per id
+│   ├── fanout-reap.sh         # V2: PR-merge check, mark completed
+│   ├── stuck-fingerprint.sh   # V2: PostToolUse hook payload handler
+│   ├── install-hook.sh        # V2: idempotent installer for the hook entry
+│   ├── uninstall-hook.sh      # V2: reverse install-hook.sh
+│   └── budget-check.sh        # V2: per-task USD cap gate
 └── prompts/
     ├── quick-lookup.md
     ├── prose.md
     ├── code-edit.md       # code-quick + code-build (with Decisions block)
     ├── planning.md        # build + cross-review note
     ├── code-review.md     # for code-review-only
-    └── cross-review.md    # the reviewer brief shape (Phase 2)
+    ├── cross-review.md    # the reviewer brief shape (Phase 2)
+    └── fanout.md          # V2: per-milestone prompt shape for code-fanout
 ```
 
 State at `~/.claude/orchestrate/`:
 - `preflight.json` — last preflight result, 5min TTL.
-- `runs.jsonl` — append-only dispatch log; entries now include `phase: "build"|"review"` and the reviewer's `verdict` field, which V2 will use for bandit routing.
+- `runs.jsonl` — append-only dispatch log; entries include `phase: "build"|"review"|"build-fix"|"review-fix"`, the reviewer's `verdict`, and (V2) optional `cost_usd_estimate`, `stuck_flagged`, `fanout_id`. V3 reads these for bandit routing.
+- `fanout-state.json` (V2) — per-id pid/log/status for in-flight fan-out cohorts.
+- `stuck.log` (V2) — append-only warnings from the PostToolUse stuck-loop detector.
+- `stuck-window.jsonl` (V2) — rolling window of the last 3 tool fingerprints (managed by `stuck-fingerprint.sh`).
 
 ## Roadmap
 
-V2:
-- **Auto-fix loop (capped)** — if the reviewer flags blockers, automatically re-dispatch to the builder with the review attached, max one fix attempt, then stop.
-- **Hook-based stuck-loop detection** via `PostToolUse`.
-- **Cost / wall-clock budget caps** beyond the current 5-min hard cap (per-task $-budget).
+V2 (shipped):
+- **Parallel fan-out (`code-fanout`)** — spawn N codex runs in parallel, capped at `ORCHESTRATE_FANOUT_CAP`, with stuck-detection via log mtime and one Opus review per completed run.
+- **Capped auto-fix loop** — `--auto-fix` / `ORCHESTRATE_AUTO_FIX=1`. On a BLOCKERS verdict, the same builder retries once with the review attached; a fresh cross-model review runs over the fix; hard cap at one attempt.
+- **Hook-based stuck-loop detection** via `PostToolUse`. Installed into `~/.claude/settings.json` by `scripts/install-hook.sh` (per upstream issue [anthropics/claude-code#19225](https://github.com/anthropics/claude-code/issues/19225), Stop/PostToolUse hooks declared inside SKILL.md don't fire — they have to live in settings.json).
+- **Per-task USD budget cap** — `ORCHESTRATE_BUDGET_USD`. `budget-check.sh` sums `cost_usd_estimate` from `runs.jsonl` per task hash and aborts dispatches that would exceed the cap.
 
-V3:
-- **Bandit routing** (Thompson sampling) over `(category, builder, reviewer) → verdict-rate` from the richer `runs.jsonl`.
+Install/uninstall the V2 hook (idempotent):
+```bash
+bash ~/.claude/skills/orchestrate/scripts/install-hook.sh         # add the entry
+bash ~/.claude/skills/orchestrate/scripts/install-hook.sh --dry-run   # preview only
+bash ~/.claude/skills/orchestrate/scripts/uninstall-hook.sh       # remove cleanly
+```
+
+V3 (next):
+- **Bandit routing** (Thompson sampling) over `(category, builder, reviewer) → verdict-rate` from the richer `runs.jsonl` (now also carrying `cost_usd_estimate` and `fanout_id`).
 - **Auto-rewriting prompt templates** from accumulated failure traces.
 - **Session resume index** over the JSONL transcript layer Claude Code already maintains.
 
